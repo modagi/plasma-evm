@@ -17,8 +17,8 @@
 package trie
 
 import (
-	"bytes"
 	"fmt"
+	"math/big"
 
 	"github.com/Onther-Tech/plasma-evm/common"
 	"github.com/Onther-Tech/plasma-evm/ethdb"
@@ -35,27 +35,20 @@ import (
 // with the node that proves the absence of the key.
 func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) error {
 	// Collect all nodes on the path to key.
-	key = keybytesToHex(key)
-	var nodes []node
 	tn := t.root
-	for len(key) > 0 && tn != nil {
+	path := KeyToPath(key)
+	var nodes []node
+
+	for i := 0; i < 256; i++ {
 		switch n := tn.(type) {
-		case *shortNode:
-			if len(key) < len(n.Key) || !bytes.Equal(n.Key, key[:len(n.Key)]) {
-				// The trie doesn't contain the key.
-				tn = nil
-			} else {
-				tn = n.Val
-				key = key[len(n.Key):]
-			}
+		case *generalNode:
+			branch := new(big.Int).And(new(big.Int).Set(new(big.Int).Rsh(path, 255)), big.NewInt(1)).Uint64()
+			tn = n.Children[branch]
 			nodes = append(nodes, n)
-		case *fullNode:
-			tn = n.Children[key[0]]
-			key = key[1:]
-			nodes = append(nodes, n)
+			path.Lsh(path, 1)
 		case hashNode:
 			var err error
-			tn, err = t.resolveHash(n, nil)
+			tn, err = t.resolveHash(n, nil, 0)
 			if err != nil {
 				log.Error(fmt.Sprintf("Unhandled trie error: %v", err))
 				return err
@@ -66,7 +59,6 @@ func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) e
 	}
 	hasher := newHasher(nil)
 	defer returnHasherToPool(hasher)
-
 	for i, n := range nodes {
 		// Don't bother checking for errors here since hasher panics
 		// if encoding doesn't work and we're not writing to any database.
@@ -104,7 +96,7 @@ func (t *SecureTrie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWri
 // key in a trie with the given root hash. VerifyProof returns an error if the
 // proof contains invalid trie nodes or the wrong value.
 func VerifyProof(rootHash common.Hash, key []byte, proofDb ethdb.KeyValueReader) (value []byte, nodes int, err error) {
-	key = keybytesToHex(key)
+	path := KeyToPath(key)
 	wantHash := rootHash
 	for i := 0; ; i++ {
 		buf, _ := proofDb.Get(wantHash[:])
@@ -115,13 +107,13 @@ func VerifyProof(rootHash common.Hash, key []byte, proofDb ethdb.KeyValueReader)
 		if err != nil {
 			return nil, i, fmt.Errorf("bad proof node %d: %v", i, err)
 		}
-		keyrest, cld := get(n, key)
+		pathrest, cld := get(n, path)
 		switch cld := cld.(type) {
 		case nil:
 			// The trie doesn't contain the key.
 			return nil, i, nil
 		case hashNode:
-			key = keyrest
+			path = pathrest
 			copy(wantHash[:], cld)
 		case valueNode:
 			return cld, i + 1, nil
@@ -129,22 +121,18 @@ func VerifyProof(rootHash common.Hash, key []byte, proofDb ethdb.KeyValueReader)
 	}
 }
 
-func get(tn node, key []byte) ([]byte, node) {
+func get(tn node, path *big.Int) (*big.Int, node) {
 	for {
 		switch n := tn.(type) {
-		case *shortNode:
-			if len(key) < len(n.Key) || !bytes.Equal(n.Key, key[:len(n.Key)]) {
-				return nil, nil
-			}
-			tn = n.Val
-			key = key[len(n.Key):]
-		case *fullNode:
-			tn = n.Children[key[0]]
-			key = key[1:]
+		case *generalNode:
+			branch := new(big.Int).And(new(big.Int).Set(new(big.Int).Rsh(path, 255)), big.NewInt(1)).Uint64()
+			tn = n.Children[branch]
+			//key = key[1:]
+			path.Lsh(path, 1)
 		case hashNode:
-			return key, n
+			return path, n
 		case nil:
-			return key, nil
+			return path, nil
 		case valueNode:
 			return nil, n
 		default:

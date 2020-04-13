@@ -263,7 +263,7 @@ func (it *nodeIterator) peek(descend bool) (*nodeIteratorState, *int, []byte, er
 		// Initialize the iterator if we've just started.
 		root := it.trie.Hash()
 		state := &nodeIteratorState{node: it.trie.root, index: -1}
-		if root != emptyRoot {
+		if root != zerohashes[0] {
 			state.hash = root
 		}
 		err := state.resolve(it.trie, nil)
@@ -296,7 +296,7 @@ func (it *nodeIterator) peek(descend bool) (*nodeIteratorState, *int, []byte, er
 
 func (st *nodeIteratorState) resolve(tr *Trie, path []byte) error {
 	if hash, ok := st.node.(hashNode); ok {
-		resolved, err := tr.resolveHash(hash, path)
+		resolved, err := tr.resolveHash(hash, path, 0)
 		if err != nil {
 			return err
 		}
@@ -308,9 +308,9 @@ func (st *nodeIteratorState) resolve(tr *Trie, path []byte) error {
 
 func (it *nodeIterator) nextChild(parent *nodeIteratorState, ancestor common.Hash) (*nodeIteratorState, []byte, bool) {
 	switch node := parent.node.(type) {
-	case *fullNode:
+	case *generalNode:
 		// Full node, move to the first non-nil child.
-		for i := parent.index + 1; i < len(node.Children); i++ {
+		for i := parent.index + 1; i < 2; i++ {
 			child := node.Children[i]
 			if child != nil {
 				hash, _ := child.cache()
@@ -325,20 +325,6 @@ func (it *nodeIterator) nextChild(parent *nodeIteratorState, ancestor common.Has
 				parent.index = i - 1
 				return state, path, true
 			}
-		}
-	case *shortNode:
-		// Short node, return the pointer singleton child
-		if parent.index < 0 {
-			hash, _ := node.Val.cache()
-			state := &nodeIteratorState{
-				hash:    common.BytesToHash(hash),
-				node:    node.Val,
-				parent:  ancestor,
-				index:   -1,
-				pathlen: len(it.path),
-			}
-			path := append(it.path, node.Key...)
-			return state, path, true
 		}
 	}
 	return parent, it.path, false

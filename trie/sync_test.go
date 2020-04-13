@@ -91,7 +91,7 @@ func TestEmptySync(t *testing.T) {
 	dbA := NewDatabase(memorydb.New())
 	dbB := NewDatabase(memorydb.New())
 	emptyA, _ := New(common.Hash{}, dbA)
-	emptyB, _ := New(emptyRoot, dbB)
+	emptyB, _ := New(zerohashes[0], dbB)
 
 	for i, trie := range []*Trie{emptyA, emptyB} {
 		if req := NewSync(trie.Hash(), memorydb.New(), nil, NewSyncBloom(1, memorydb.New())).Missing(1); len(req) != 0 {

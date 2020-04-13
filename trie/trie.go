@@ -20,15 +20,17 @@ package trie
 import (
 	"bytes"
 	"fmt"
+	"math/big"
 
 	"github.com/Onther-Tech/plasma-evm/common"
 	"github.com/Onther-Tech/plasma-evm/crypto"
 	"github.com/Onther-Tech/plasma-evm/log"
+	"github.com/Onther-Tech/plasma-evm/rlp"
 )
 
 var (
 	// emptyRoot is the known root hash of an empty trie.
-	emptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+	emptyRoot = common.HexToHash("af3788d3f0a8b4cc2519acfffb4d898cccb0951892d3ba627c2c9d7eb1d1ac26")
 
 	// emptyState is the known hash of an empty state trie entry.
 	emptyState = crypto.Keccak256Hash(nil)
@@ -64,11 +66,10 @@ func New(root common.Hash, db *Database) (*Trie, error) {
 	if db == nil {
 		panic("trie.New called without a database")
 	}
-	trie := &Trie{
-		db: db,
-	}
+	tt256m1 = new(big.Int).Sub(new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil), big.NewInt(1))
+	trie := &Trie{db: db}
 	if root != (common.Hash{}) && root != emptyRoot {
-		rootnode, err := trie.resolveHash(root[:], nil)
+		rootnode, err := trie.resolveHash(root[:], nil, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -97,44 +98,81 @@ func (t *Trie) Get(key []byte) []byte {
 // The value bytes must not be modified by the caller.
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *Trie) TryGet(key []byte) ([]byte, error) {
-	key = keybytesToHex(key)
-	value, newroot, didResolve, err := t.tryGet(t.root, key, 0)
+	path := KeyToPath(key)
+	value, newroot, didResolve, err := t.tryGet(t.root, 0, path)
 	if err == nil && didResolve {
 		t.root = newroot
 	}
 	return value, err
 }
 
-func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode node, didResolve bool, err error) {
+func KeyToPath(key []byte) (result *big.Int) {
+	result = new(big.Int)
+	for _, c := range key[:] {
+		result.Add(result.Lsh(result, 8), big.NewInt(int64(c)))
+	}
+	return result
+}
+
+func PathToKey(path *big.Int) []byte {
+	tmp1 := new(big.Int).Set(path)
+	tmp2 := new(big.Int).And(tmp1, tt256m1)
+	tmp := tmp2.Bytes()
+	if len(tmp) != 32 {
+		for len(tmp) < 32 {
+			tmp = append([]byte("\x00"), tmp...)
+		}
+	}
+	return tmp
+}
+
+func (t *Trie) tryGet(origNode node, depth uint32, path *big.Int) (value []byte, newnode node, didResolve bool, err error) {
 	switch n := (origNode).(type) {
 	case nil:
 		return nil, nil, false, nil
 	case valueNode:
 		return n, n, false, nil
-	case *shortNode:
-		if len(key)-pos < len(n.Key) || !bytes.Equal(n.Key, key[pos:pos+len(n.Key)]) {
-			// key not found in trie
-			return nil, n, false, nil
+	case *generalNode:
+		hashed, _ := n.cache()
+		if bytes.Equal(hashed, zerohashes[depth][:]) {
+			return bytes.Repeat([]byte{0x00}, 32), n, false, nil
+		} else if ok, _ := t.getSingleKeySubtree(n, depth); ok {
+			_, path2, value := decodeSingleKeyNode(n.Children[2].(valueNode))
+			if new(big.Int).Mod(new(big.Int).Set(path), new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil)).Cmp(path2) == 0 {
+				return value, n, false, nil
+			} else {
+				return bytes.Repeat([]byte{0x00}, 32), n, false, nil
+			}
+		} else {
+			if new(big.Int).And(new(big.Int).Rsh(path, 255), big.NewInt(1)).Uint64() == 1 {
+				value, _, _, err := t.tryGet(n.Children[1], depth+1, new(big.Int).Lsh(path, 1))
+				if err != nil {
+					//TODO: error
+				}
+				return value, n, false, nil
+			} else {
+				value, _, _, err := t.tryGet(n.Children[0], depth+1, new(big.Int).Lsh(path, 1))
+				if err != nil {
+					//TODO: error
+				}
+				return value, n, false, nil
+			}
 		}
-		value, newnode, didResolve, err = t.tryGet(n.Val, key, pos+len(n.Key))
-		if err == nil && didResolve {
-			n = n.copy()
-			n.Val = newnode
-		}
-		return value, n, didResolve, err
-	case *fullNode:
-		value, newnode, didResolve, err = t.tryGet(n.Children[key[pos]], key, pos+1)
-		if err == nil && didResolve {
-			n = n.copy()
-			n.Children[key[pos]] = newnode
-		}
-		return value, n, didResolve, err
 	case hashNode:
-		child, err := t.resolveHash(n, key[:pos])
+		if bytes.Equal(n, zerohashes[depth][:]) {
+			return bytes.Repeat([]byte{0x00}, 32), n, false, nil
+		} else if depth == 256 {
+			var buf []byte
+			if err := rlp.DecodeBytes(n, &buf); err == nil {
+				return valueNode(buf), valueNode(buf), true, nil
+			} else {
+			}
+		}
+		child, err := t.resolveHash(n, nil, depth)
 		if err != nil {
 			return nil, n, true, err
 		}
-		value, newnode, _, err := t.tryGet(child, key, pos)
+		value, newnode, _, err := t.tryGet(child, depth, path)
 		return value, newnode, true, err
 	default:
 		panic(fmt.Sprintf("%T: invalid node: %v", origNode, origNode))
@@ -162,15 +200,15 @@ func (t *Trie) Update(key, value []byte) {
 //
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *Trie) TryUpdate(key, value []byte) error {
-	k := keybytesToHex(key)
+	path := KeyToPath(key)
 	if len(value) != 0 {
-		_, n, err := t.insert(t.root, nil, k, valueNode(value))
+		_, n, err := t.insert(t.root, 0, key, path, valueNode(value))
 		if err != nil {
 			return err
 		}
 		t.root = n
 	} else {
-		_, n, err := t.delete(t.root, nil, k)
+		_, n, err := t.delete(t.root, 0, nil, path)
 		if err != nil {
 			return err
 		}
@@ -179,65 +217,221 @@ func (t *Trie) TryUpdate(key, value []byte) error {
 	return nil
 }
 
-func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error) {
-	if len(key) == 0 {
+func (t *Trie) getSubtreeRoot(n node) []byte {
+	switch n := n.(type) {
+	case hashNode:
+		return n[:]
+	case valueNode:
+		return n[:]
+	case *generalNode:
+		h := newHasher(nil)
+		defer returnHasherToPool(h)
+		_, cached, _ := h.hash(n, nil, false)
+		hashed, _ := cached.cache()
+		return hashed
+	}
+	return nil
+}
+
+func hashGeneralNode(n *generalNode, depth uint32) hashNode {
+	h := newHasher(nil)
+	defer returnHasherToPool(h)
+	var buf []byte
+	for i := 0; i < 2; i++ {
+		var cn []byte
+		switch n := n.Children[i].(type) {
+		case *generalNode:
+			cn = n.flags.hash
+		case hashNode:
+			cn = n
+		case valueNode:
+			cn = n
+		case nil:
+			cn = zerohashes[depth+1][:]
+		default:
+			// TODO: error
+		}
+		en, err := rlp.EncodeToBytes(cn)
+		if err != nil {
+			// TODO: error
+		}
+		buf = append(buf, en...)
+	}
+
+	return h.makeHashNode(buf)
+}
+
+func (t *Trie) makeSingleKeyNode(n node, path *big.Int, depth uint32, value []byte) node {
+	h := newHasher(nil)
+	defer returnHasherToPool(h)
+	if depth == 256 {
+		return valueNode(value)
+	}
+	gn := n.(*generalNode)
+	if new(big.Int).And(new(big.Int).Rsh(path, 255), big.NewInt(1)).Uint64() == 1 {
+		if gn.Children[1] == nil {
+			cn := &generalNode{flags: t.newFlag()}
+			cn.flags.hash = zerohashes[depth+1][:]
+			gn.Children[1] = cn
+		}
+		nn := t.makeSingleKeyNode(gn.Children[1], new(big.Int).Set(path).Lsh(path, 1), depth+1, value)
+		gn.Children[1] = nn
+		gn.flags.hash = hashGeneralNode(gn, depth)
+		return gn
+	} else {
+		if gn.Children[0] == nil {
+			cn := &generalNode{flags: t.newFlag()}
+			cn.flags.hash = zerohashes[depth+1][:]
+			gn.Children[0] = cn
+		}
+		nn := t.makeSingleKeyNode(gn.Children[0], new(big.Int).Set(path).Lsh(path, 1), depth+1, value)
+		gn.Children[0] = nn
+		gn.flags.hash = hashGeneralNode(gn, depth)
+		return gn
+	}
+}
+
+func (t *Trie) makeDoubleKeyNode(n *generalNode, path1, path2 *big.Int, depth uint32, value1, value2 []byte) node {
+	if depth == 256 {
+		//TODO: error
+		return nil
+	}
+	var cn node
+	h := newHasher(nil)
+	defer returnHasherToPool(h)
+	if new(big.Int).And(new(big.Int).Rsh(path1, 255), big.NewInt(1)).Uint64() == 1 {
+		if new(big.Int).And(new(big.Int).Rsh(path2, 255), big.NewInt(1)).Uint64() == 1 {
+			tmp := t.makeDoubleKeyNode(n.Children[1].(*generalNode), new(big.Int).Lsh(path1, 1), new(big.Int).Lsh(path2, 1), depth+1, value1, value2)
+			n.Children[1] = tmp
+			n.flags.hash = hashGeneralNode(n, depth)
+			return n
+		} else {
+			for i := 0; i < 2; i++ {
+				if n.Children[i] == nil {
+					n.Children[i] = &generalNode{flags: t.newFlag()}
+				}
+			}
+			L := t.makeSingleKeyNode(n.Children[0].(*generalNode), new(big.Int).Lsh(path2, 1), depth+1, value2)
+			R := t.makeSingleKeyNode(n.Children[1].(*generalNode), new(big.Int).Lsh(path1, 1), depth+1, value1)
+			L.(*generalNode).Children[2] = encodeSingleKeyNode(depth, new(big.Int).Lsh(path2, 1), value2)
+			R.(*generalNode).Children[2] = encodeSingleKeyNode(depth, new(big.Int).Lsh(path1, 1), value1)
+			n.Children[0] = L
+			n.Children[1] = R
+			n.flags.hash = hashGeneralNode(n, depth)
+			cn = n
+		}
+	} else {
+		if new(big.Int).And(new(big.Int).Rsh(path2, 255), big.NewInt(1)).Uint64() == 1 {
+			for i := 0; i < 2; i++ {
+				if n.Children[i] == nil {
+					n.Children[i] = &generalNode{flags: t.newFlag()}
+				}
+			}
+			L := t.makeSingleKeyNode(n.Children[0].(*generalNode), new(big.Int).Lsh(path1, 1), depth+1, value1)
+			R := t.makeSingleKeyNode(n.Children[1].(*generalNode), new(big.Int).Lsh(path2, 1), depth+1, value2)
+			L.(*generalNode).Children[2] = encodeSingleKeyNode(depth, new(big.Int).Lsh(path1, 1), value1)
+			R.(*generalNode).Children[2] = encodeSingleKeyNode(depth, new(big.Int).Lsh(path2, 1), value2)
+			n.Children[0] = L
+			n.Children[1] = R
+			n.flags.hash = hashGeneralNode(n, depth)
+			cn = n
+		} else {
+			tmp := t.makeDoubleKeyNode(n.Children[0].(*generalNode), new(big.Int).Lsh(path1, 1), new(big.Int).Lsh(path2, 1), depth+1, value1, value2)
+			n.Children[0] = tmp
+			n.flags.hash = hashGeneralNode(n, depth)
+			cn = n
+		}
+	}
+	return cn
+}
+
+func (t *Trie) getSingleKeySubtree(n *generalNode, depth uint32) (bool, node) {
+	var sn node
+	if n.Children[2] != nil {
+		return true, nil
+	}
+	//TODO: remove node
+	return sn != nil, sn
+}
+
+func (t *Trie) getFromHashNode(n node, depth uint32) (node, error) {
+	var hn hashNode
+	switch n := n.(type) {
+	case hashNode:
+		hn = n
+	}
+
+	switch v := n.(type) {
+	case *generalNode:
+		if bytes.Equal(v.flags.hash, zerohashes[depth][:]) {
+			newNode := &generalNode{flags: t.newFlag()}
+			return newNode, nil
+		}
+	case hashNode:
+		if bytes.Equal(v[:], zerohashes[depth][:]) {
+			newNode := &generalNode{flags: t.newFlag()}
+			return newNode, nil
+		}
+	}
+
+	// We've hit a part of the trie that isn't loaded yet. Load
+	// the node and insert into it. This leaves all child nodes on
+	// the path to the value in the trie.
+	rn, err := t.resolveHash(hn, nil, depth)
+	if err != nil {
+		return nil, err
+	}
+	return rn, nil
+}
+
+func (t *Trie) insert(n node, depth uint32, key []byte, path *big.Int, value node) (bool, node, error) {
+	if depth == 256 {
 		if v, ok := n.(valueNode); ok {
 			return !bytes.Equal(v, value.(valueNode)), value, nil
 		}
 		return true, value, nil
 	}
 	switch n := n.(type) {
-	case *shortNode:
-		matchlen := prefixLen(key, n.Key)
-		// If the whole key matches, keep this short node as is
-		// and only update the value.
-		if matchlen == len(n.Key) {
-			dirty, nn, err := t.insert(n.Val, append(prefix, key[:matchlen]...), key[matchlen:], value)
-			if !dirty || err != nil {
-				return false, n, err
+	case *generalNode:
+		if bytes.Equal(n.flags.hash, zerohashes[depth][:]) {
+			nn := t.makeSingleKeyNode(n, path, depth, value.(valueNode)[:])
+			nn.(*generalNode).Children[2] = encodeSingleKeyNode(depth+1, new(big.Int).Lsh(path, 1), value.(valueNode)[:])
+			nn.(*generalNode).flags.hash = hashGeneralNode(nn.(*generalNode), depth)
+			return true, nn, nil
+		} else if n.Children[2] != nil {
+			_, path2, value2 := decodeSingleKeyNode(n.Children[2].(valueNode))
+			n.Children[2] = nil
+			nn := t.makeDoubleKeyNode(n, path, path2, depth, value.(valueNode)[:], value2)
+			nn.(*generalNode).flags.hash = hashGeneralNode(nn.(*generalNode), depth)
+			return true, nn, nil
+		} else if new(big.Int).And(new(big.Int).Rsh(path, 255), big.NewInt(1)).Uint64() == 1 {
+			ok, nn, err := t.insert(n.Children[1], depth+1, key, new(big.Int).Lsh(path, 1), value)
+			if !ok || err != nil {
+				//TODO: error
 			}
-			return true, &shortNode{n.Key, nn, t.newFlag()}, nil
-		}
-		// Otherwise branch out at the index where they differ.
-		branch := &fullNode{flags: t.newFlag()}
-		var err error
-		_, branch.Children[n.Key[matchlen]], err = t.insert(nil, append(prefix, n.Key[:matchlen+1]...), n.Key[matchlen+1:], n.Val)
-		if err != nil {
-			return false, nil, err
-		}
-		_, branch.Children[key[matchlen]], err = t.insert(nil, append(prefix, key[:matchlen+1]...), key[matchlen+1:], value)
-		if err != nil {
-			return false, nil, err
-		}
-		// Replace this shortNode with the branch if it occurs at index 0.
-		if matchlen == 0 {
-			return true, branch, nil
-		}
-		// Otherwise, replace it with a short node leading up to the branch.
-		return true, &shortNode{key[:matchlen], branch, t.newFlag()}, nil
 
-	case *fullNode:
-		dirty, nn, err := t.insert(n.Children[key[0]], append(prefix, key[0]), key[1:], value)
-		if !dirty || err != nil {
-			return false, n, err
+			n.Children[1] = nn
+			n.flags.hash = hashGeneralNode(n, depth)
+			return true, n, nil
+		} else {
+			ok, nn, err := t.insert(n.Children[0], depth+1, key, new(big.Int).Lsh(path, 1), value)
+			if !ok || err != nil {
+				//TODO: error
+			}
+			n.Children[0] = nn
+			n.flags.hash = hashGeneralNode(n, depth)
+			return true, n, nil
 		}
-		n = n.copy()
-		n.flags = t.newFlag()
-		n.Children[key[0]] = nn
-		return true, n, nil
-
 	case nil:
-		return true, &shortNode{key, value, t.newFlag()}, nil
-
+		MakeZeroHashes()
+		newNode := &generalNode{flags: t.newFlag()}
+		nn := t.makeSingleKeyNode(newNode, path, depth, value.(valueNode)[:])
+		nn.(*generalNode).Children[2] = encodeSingleKeyNode(depth, path, value.(valueNode)[:])
+		nn.(*generalNode).flags.hash = hashGeneralNode(nn.(*generalNode), depth)
+		return true, nn, nil
 	case hashNode:
-		// We've hit a part of the trie that isn't loaded yet. Load
-		// the node and insert into it. This leaves all child nodes on
-		// the path to the value in the trie.
-		rn, err := t.resolveHash(n, prefix)
-		if err != nil {
-			return false, nil, err
-		}
-		dirty, nn, err := t.insert(rn, prefix, key, value)
+		rn, err := t.getFromHashNode(n, depth)
+		dirty, nn, err := t.insert(rn, depth, key, path, value)
 		if !dirty || err != nil {
 			return false, rn, err
 		}
@@ -258,8 +452,8 @@ func (t *Trie) Delete(key []byte) {
 // TryDelete removes any existing value for key from the trie.
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *Trie) TryDelete(key []byte) error {
-	k := keybytesToHex(key)
-	_, n, err := t.delete(t.root, nil, k)
+	path := KeyToPath(key)
+	_, n, err := t.delete(t.root, 0, key, path)
 	if err != nil {
 		return err
 	}
@@ -270,88 +464,19 @@ func (t *Trie) TryDelete(key []byte) error {
 // delete returns the new root of the trie with key deleted.
 // It reduces the trie to minimal form by simplifying
 // nodes on the way up after deleting recursively.
-func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
+func (t *Trie) delete(n node, depth uint32, key []byte, path *big.Int) (bool, node, error) {
 	switch n := n.(type) {
-	case *shortNode:
-		matchlen := prefixLen(key, n.Key)
-		if matchlen < len(n.Key) {
-			return false, n, nil // don't replace n on mismatch
-		}
-		if matchlen == len(key) {
-			return true, nil, nil // remove n entirely for whole matches
-		}
-		// The key is longer than n.Key. Remove the remaining suffix
-		// from the subtrie. Child can never be nil here since the
-		// subtrie must contain at least two other values with keys
-		// longer than n.Key.
-		dirty, child, err := t.delete(n.Val, append(prefix, key[:len(n.Key)]...), key[len(n.Key):])
-		if !dirty || err != nil {
-			return false, n, err
-		}
-		switch child := child.(type) {
-		case *shortNode:
-			// Deleting from the subtrie reduced it to another
-			// short node. Merge the nodes to avoid creating a
-			// shortNode{..., shortNode{...}}. Use concat (which
-			// always creates a new slice) instead of append to
-			// avoid modifying n.Key since it might be shared with
-			// other nodes.
-			return true, &shortNode{concat(n.Key, child.Key...), child.Val, t.newFlag()}, nil
-		default:
-			return true, &shortNode{n.Key, child, t.newFlag()}, nil
-		}
-
-	case *fullNode:
-		dirty, nn, err := t.delete(n.Children[key[0]], append(prefix, key[0]), key[1:])
+	case *generalNode:
+		branch := new(big.Int).And(new(big.Int).Rsh(path, 255), big.NewInt(1)).Uint64()
+		dirty, nn, err := t.delete(n.Children[branch], depth+1, key, path.Lsh(path, 4))
 		if !dirty || err != nil {
 			return false, n, err
 		}
 		n = n.copy()
 		n.flags = t.newFlag()
-		n.Children[key[0]] = nn
+		n.Children[branch] = nn
+		n.flags.hash = hashGeneralNode(n, depth)
 
-		// Check how many non-nil entries are left after deleting and
-		// reduce the full node to a short node if only one entry is
-		// left. Since n must've contained at least two children
-		// before deletion (otherwise it would not be a full node) n
-		// can never be reduced to nil.
-		//
-		// When the loop is done, pos contains the index of the single
-		// value that is left in n or -2 if n contains at least two
-		// values.
-		pos := -1
-		for i, cld := range &n.Children {
-			if cld != nil {
-				if pos == -1 {
-					pos = i
-				} else {
-					pos = -2
-					break
-				}
-			}
-		}
-		if pos >= 0 {
-			if pos != 16 {
-				// If the remaining entry is a short node, it replaces
-				// n and its key gets the missing nibble tacked to the
-				// front. This avoids creating an invalid
-				// shortNode{..., shortNode{...}}.  Since the entry
-				// might not be loaded yet, resolve it just for this
-				// check.
-				cnode, err := t.resolve(n.Children[pos], prefix)
-				if err != nil {
-					return false, nil, err
-				}
-				if cnode, ok := cnode.(*shortNode); ok {
-					k := append([]byte{byte(pos)}, cnode.Key...)
-					return true, &shortNode{k, cnode.Val, t.newFlag()}, nil
-				}
-			}
-			// Otherwise, n is replaced by a one-nibble short node
-			// containing the child.
-			return true, &shortNode{[]byte{byte(pos)}, n.Children[pos], t.newFlag()}, nil
-		}
-		// n still contains at least two values and cannot be reduced.
 		return true, n, nil
 
 	case valueNode:
@@ -364,11 +489,11 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 		// We've hit a part of the trie that isn't loaded yet. Load
 		// the node and delete from it. This leaves all child nodes on
 		// the path to the value in the trie.
-		rn, err := t.resolveHash(n, prefix)
+		rn, err := t.resolveHash(n, nil, depth)
 		if err != nil {
 			return false, nil, err
 		}
-		dirty, nn, err := t.delete(rn, prefix, key)
+		dirty, nn, err := t.delete(rn, depth, key, path)
 		if !dirty || err != nil {
 			return false, rn, err
 		}
@@ -388,14 +513,14 @@ func concat(s1 []byte, s2 ...byte) []byte {
 
 func (t *Trie) resolve(n node, prefix []byte) (node, error) {
 	if n, ok := n.(hashNode); ok {
-		return t.resolveHash(n, prefix)
+		return t.resolveHash(n, prefix, 0)
 	}
 	return n, nil
 }
 
-func (t *Trie) resolveHash(n hashNode, prefix []byte) (node, error) {
+func (t *Trie) resolveHash(n hashNode, prefix []byte, depth uint32) (node, error) {
 	hash := common.BytesToHash(n)
-	if node := t.db.node(hash); node != nil {
+	if node := t.db.node(hash, depth); node != nil {
 		return node, nil
 	}
 	return nil, &MissingNodeError{NodeHash: hash, Path: prefix}
@@ -425,7 +550,7 @@ func (t *Trie) Commit(onleaf LeafCallback) (root common.Hash, err error) {
 
 func (t *Trie) hashRoot(db *Database, onleaf LeafCallback) (node, node, error) {
 	if t.root == nil {
-		return hashNode(emptyRoot.Bytes()), nil, nil
+		return hashNode(emptyRoot[:]), nil, nil
 	}
 	h := newHasher(onleaf)
 	defer returnHasherToPool(h)

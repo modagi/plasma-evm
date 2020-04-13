@@ -17,9 +17,11 @@
 package trie
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"reflect"
 	"sync"
 	"time"
@@ -56,6 +58,9 @@ var (
 	memcacheCommitSizeMeter  = metrics.NewRegisteredMeter("trie/memcache/commit/size", nil)
 )
 
+var zerohashes []common.Hash
+var tt256m1 *big.Int
+
 // secureKeyPrefix is the database key prefix used to store trie node preimages.
 var secureKeyPrefix = []byte("secure-key-")
 
@@ -73,6 +78,7 @@ const secureKeyLength = 11 + 32
 type Database struct {
 	diskdb ethdb.KeyValueStore // Persistent storage for matured trie nodes
 
+	//Zerohashes []common.Hash
 	cleans  *fastcache.Cache            // GC friendly memory cache of clean node RLPs
 	dirties map[common.Hash]*cachedNode // Data and references relationships of dirty nodes
 	oldest  common.Hash                 // Oldest tracked node, flush-list head
@@ -107,15 +113,15 @@ func (n rawNode) fstring(ind string) string { panic("this should never end up in
 // rawFullNode represents only the useful data content of a full node, with the
 // caches and flags stripped out to minimize its data storage. This type honors
 // the same RLP encoding as the original parent.
-type rawFullNode [17]node
+type rawFullNode [2]node
 
 func (n rawFullNode) cache() (hashNode, bool)   { panic("this should never end up in a live trie") }
 func (n rawFullNode) fstring(ind string) string { panic("this should never end up in a live trie") }
 
 func (n rawFullNode) EncodeRLP(w io.Writer) error {
-	var nodes [17]node
-
-	for i, child := range n {
+	var nodes [2]node
+	for i := 0; i < 2; i++ {
+		child := n[i]
 		if child != nil {
 			nodes[i] = child
 		} else {
@@ -124,17 +130,6 @@ func (n rawFullNode) EncodeRLP(w io.Writer) error {
 	}
 	return rlp.Encode(w, nodes)
 }
-
-// rawShortNode represents only the useful data content of a short node, with the
-// caches and flags stripped out to minimize its data storage. This type honors
-// the same RLP encoding as the original parent.
-type rawShortNode struct {
-	Key []byte
-	Val node
-}
-
-func (n rawShortNode) cache() (hashNode, bool)   { panic("this should never end up in a live trie") }
-func (n rawShortNode) fstring(ind string) string { panic("this should never end up in a live trie") }
 
 // cachedNode is all the information we know about a single cached node in the
 // memory database write layer.
@@ -164,6 +159,13 @@ func (n *cachedNode) rlp() []byte {
 	if node, ok := n.node.(rawNode); ok {
 		return node
 	}
+	if v, ok := n.node.(*generalNode); ok {
+		blob, err := rlp.EncodeToBytes(v)
+		if err != nil {
+			panic(err)
+		}
+		return blob
+	}
 	blob, err := rlp.EncodeToBytes(n.node)
 	if err != nil {
 		panic(err)
@@ -175,7 +177,7 @@ func (n *cachedNode) rlp() []byte {
 // or by regenerating it from the rlp encoded blob.
 func (n *cachedNode) obj(hash common.Hash) node {
 	if node, ok := n.node.(rawNode); ok {
-		return mustDecodeNode(hash[:], node)
+		return mustDecodeNode(hash[:], node, 0)
 	}
 	return expandNode(hash[:], n.node)
 }
@@ -196,10 +198,8 @@ func (n *cachedNode) forChilds(onChild func(hash common.Hash)) {
 // invokes the callback for all the hashnode children.
 func forGatherChildren(n node, onChild func(hash common.Hash)) {
 	switch n := n.(type) {
-	case *rawShortNode:
-		forGatherChildren(n.Val, onChild)
 	case rawFullNode:
-		for i := 0; i < 16; i++ {
+		for i := 0; i < 2; i++ {
 			forGatherChildren(n[i], onChild)
 		}
 	case hashNode:
@@ -214,13 +214,8 @@ func forGatherChildren(n node, onChild func(hash common.Hash)) {
 // all the internal caches, returning a node that only contains the raw data.
 func simplifyNode(n node) node {
 	switch n := n.(type) {
-	case *shortNode:
-		// Short nodes discard the flags and cascade
-		return &rawShortNode{Key: n.Key, Val: simplifyNode(n.Val)}
-
-	case *fullNode:
-		// Full nodes discard the flags and cascade
-		node := rawFullNode(n.Children)
+	case *generalNode:
+		node := rawFullNode{n.Children[0], n.Children[1]}
 		for i := 0; i < len(node); i++ {
 			if node[i] != nil {
 				node[i] = simplifyNode(node[i])
@@ -240,24 +235,14 @@ func simplifyNode(n node) node {
 // all fields and keys into expanded memory form.
 func expandNode(hash hashNode, n node) node {
 	switch n := n.(type) {
-	case *rawShortNode:
-		// Short nodes need key and child expansion
-		return &shortNode{
-			Key: compactToHex(n.Key),
-			Val: expandNode(nil, n.Val),
-			flags: nodeFlag{
-				hash: hash,
-			},
-		}
-
 	case rawFullNode:
 		// Full nodes need child expansion
-		node := &fullNode{
+		node := &generalNode{
 			flags: nodeFlag{
 				hash: hash,
 			},
 		}
-		for i := 0; i < len(node.Children); i++ {
+		for i := 0; i < 2; i++ {
 			if n[i] != nil {
 				node.Children[i] = expandNode(nil, n[i])
 			}
@@ -279,6 +264,23 @@ func NewDatabase(diskdb ethdb.KeyValueStore) *Database {
 	return NewDatabaseWithCache(diskdb, 0)
 }
 
+func MakeZeroHashes() {
+	if len(zerohashes) == 0 {
+		zerohashes = make([]common.Hash, 257)
+
+		copy(zerohashes[256][:], bytes.Repeat([]byte{0x00}, 32))
+		//hasher := newHasher(nil)
+		for i := uint32(256); i > 0; i-- {
+			n := &generalNode{}
+			n.Children[0] = hashNode(zerohashes[i][:])
+			n.Children[1] = hashNode(zerohashes[i][:])
+			hashed := hashGeneralNode(n, i-1)
+			zerohashes[i-1].SetBytes(hashed[:])
+		}
+		tt256m1 = new(big.Int).Sub(new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil), big.NewInt(1))
+	}
+}
+
 // NewDatabaseWithCache creates a new trie database to store ephemeral trie content
 // before its written out to disk or garbage collected. It also acts as a read cache
 // for nodes loaded from disk.
@@ -287,7 +289,8 @@ func NewDatabaseWithCache(diskdb ethdb.KeyValueStore, cache int) *Database {
 	if cache > 0 {
 		cleans = fastcache.New(cache * 1024 * 1024)
 	}
-	return &Database{
+
+	db := &Database{
 		diskdb: diskdb,
 		cleans: cleans,
 		dirties: map[common.Hash]*cachedNode{{}: {
@@ -295,6 +298,10 @@ func NewDatabaseWithCache(diskdb ethdb.KeyValueStore, cache int) *Database {
 		}},
 		preimages: make(map[common.Hash][]byte),
 	}
+
+	MakeZeroHashes()
+
+	return db
 }
 
 // DiskDB retrieves the persistent storage backing the trie database.
@@ -360,13 +367,13 @@ func (db *Database) insertPreimage(hash common.Hash, preimage []byte) {
 
 // node retrieves a cached trie node from memory, or returns nil if none can be
 // found in the memory cache.
-func (db *Database) node(hash common.Hash) node {
+func (db *Database) node(hash common.Hash, depth uint32) node {
 	// Retrieve the node from the clean cache if available
 	if db.cleans != nil {
 		if enc := db.cleans.Get(nil, hash[:]); enc != nil {
 			memcacheCleanHitMeter.Mark(1)
 			memcacheCleanReadMeter.Mark(int64(len(enc)))
-			return mustDecodeNode(hash[:], enc)
+			return mustDecodeNode(hash[:], enc, 0)
 		}
 	}
 	// Retrieve the node from the dirty cache if available
@@ -391,7 +398,8 @@ func (db *Database) node(hash common.Hash) node {
 		memcacheCleanMissMeter.Mark(1)
 		memcacheCleanWriteMeter.Mark(int64(len(enc)))
 	}
-	return mustDecodeNode(hash[:], enc)
+
+	return mustDecodeNode(hash[:], enc, depth)
 }
 
 // Node retrieves an encoded cached trie node from memory. If it cannot be found

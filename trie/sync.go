@@ -93,7 +93,7 @@ func NewSync(root common.Hash, database ethdb.KeyValueReader, callback LeafCallb
 // AddSubTrie registers a new trie to the sync code, rooted at the designated parent.
 func (s *Sync) AddSubTrie(root common.Hash, depth int, parent common.Hash, callback LeafCallback) {
 	// Short circuit if the trie is empty or already known
-	if root == emptyRoot {
+	if root == zerohashes[0] {
 		return
 	}
 	if _, ok := s.membatch.batch[root]; ok {
@@ -265,13 +265,8 @@ func (s *Sync) children(req *request, object node) ([]*request, error) {
 	var children []child
 
 	switch node := (object).(type) {
-	case *shortNode:
-		children = []child{{
-			node:  node.Val,
-			depth: req.depth + len(node.Key),
-		}}
-	case *fullNode:
-		for i := 0; i < 17; i++ {
+	case *generalNode:
+		for i := 0; i < 2; i++ {
 			if node.Children[i] != nil {
 				children = append(children, child{
 					node:  node.Children[i],

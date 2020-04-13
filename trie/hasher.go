@@ -80,7 +80,7 @@ func (h *hasher) hash(n node, db *Database, force bool) (node, node, error) {
 		}
 		if !dirty {
 			switch n.(type) {
-			case *fullNode, *shortNode:
+			case *generalNode:
 				return hash, hash, nil
 			default:
 				return hash, n, nil
@@ -101,12 +101,7 @@ func (h *hasher) hash(n node, db *Database, force bool) (node, node, error) {
 	// without copying the node first because hashChildren copies it.
 	cachedHash, _ := hashed.(hashNode)
 	switch cn := cached.(type) {
-	case *shortNode:
-		cn.flags.hash = cachedHash
-		if db != nil {
-			cn.flags.dirty = false
-		}
-	case *fullNode:
+	case *generalNode:
 		cn.flags.hash = cachedHash
 		if db != nil {
 			cn.flags.dirty = false
@@ -122,25 +117,11 @@ func (h *hasher) hashChildren(original node, db *Database) (node, node, error) {
 	var err error
 
 	switch n := original.(type) {
-	case *shortNode:
-		// Hash the short node's child, caching the newly hashed subtree
-		collapsed, cached := n.copy(), n.copy()
-		collapsed.Key = hexToCompact(n.Key)
-		cached.Key = common.CopyBytes(n.Key)
-
-		if _, ok := n.Val.(valueNode); !ok {
-			collapsed.Val, cached.Val, err = h.hash(n.Val, db, false)
-			if err != nil {
-				return original, original, err
-			}
-		}
-		return collapsed, cached, nil
-
-	case *fullNode:
+	case *generalNode:
 		// Hash the full node's children, caching the newly hashed subtrees
 		collapsed, cached := n.copy(), n.copy()
 
-		for i := 0; i < 16; i++ {
+		for i := 0; i < 2; i++ {
 			if n.Children[i] != nil {
 				collapsed.Children[i], cached.Children[i], err = h.hash(n.Children[i], db, false)
 				if err != nil {
@@ -148,7 +129,7 @@ func (h *hasher) hashChildren(original node, db *Database) (node, node, error) {
 				}
 			}
 		}
-		cached.Children[16] = n.Children[16]
+		cached.Children[2] = n.Children[2]
 		return collapsed, cached, nil
 
 	default:
@@ -170,9 +151,6 @@ func (h *hasher) store(n node, db *Database, force bool) (node, error) {
 	if err := rlp.Encode(&h.tmp, n); err != nil {
 		panic("encode error: " + err.Error())
 	}
-	if len(h.tmp) < 32 && !force {
-		return n, nil // Nodes smaller than 32 bytes are stored inside their parent
-	}
 	// Larger nodes are replaced by their hash and stored in the database.
 	hash, _ := n.cache()
 	if hash == nil {
@@ -190,11 +168,7 @@ func (h *hasher) store(n node, db *Database, force bool) (node, error) {
 		// Track external references from account->storage trie
 		if h.onleaf != nil {
 			switch n := n.(type) {
-			case *shortNode:
-				if child, ok := n.Val.(valueNode); ok {
-					h.onleaf(child, hash)
-				}
-			case *fullNode:
+			case *generalNode:
 				for i := 0; i < 16; i++ {
 					if child, ok := n.Children[i].(valueNode); ok {
 						h.onleaf(child, hash)
