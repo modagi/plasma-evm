@@ -17,7 +17,6 @@
 package trie
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +26,7 @@ import (
 	"time"
 
 	"github.com/Onther-Tech/plasma-evm/common"
+	"github.com/Onther-Tech/plasma-evm/crypto"
 	"github.com/Onther-Tech/plasma-evm/ethdb"
 	"github.com/Onther-Tech/plasma-evm/log"
 	"github.com/Onther-Tech/plasma-evm/metrics"
@@ -58,8 +58,10 @@ var (
 	memcacheCommitSizeMeter  = metrics.NewRegisteredMeter("trie/memcache/commit/size", nil)
 )
 
-var zerohashes []common.Hash
-var tt256m1 *big.Int
+var zerohashes [][]byte
+
+//var tt256m1 *big.Int
+var tt256m1 = new(big.Int).Sub(new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil), big.NewInt(1))
 
 // secureKeyPrefix is the database key prefix used to store trie node preimages.
 var secureKeyPrefix = []byte("secure-key-")
@@ -113,19 +115,19 @@ func (n rawNode) fstring(ind string) string { panic("this should never end up in
 // rawFullNode represents only the useful data content of a full node, with the
 // caches and flags stripped out to minimize its data storage. This type honors
 // the same RLP encoding as the original parent.
-type rawFullNode [2]node
+type rawFullNode [3]node
 
 func (n rawFullNode) cache() (hashNode, bool)   { panic("this should never end up in a live trie") }
 func (n rawFullNode) fstring(ind string) string { panic("this should never end up in a live trie") }
 
 func (n rawFullNode) EncodeRLP(w io.Writer) error {
-	var nodes [2]node
-	for i := 0; i < 2; i++ {
+	var nodes [3]node
+	for i := 0; i < 3; i++ {
 		child := n[i]
 		if child != nil {
 			nodes[i] = child
 		} else {
-			nodes[i] = nilValueNode
+			nodes[i] = nil
 		}
 	}
 	return rlp.Encode(w, nodes)
@@ -159,7 +161,7 @@ func (n *cachedNode) rlp() []byte {
 	if node, ok := n.node.(rawNode); ok {
 		return node
 	}
-	if v, ok := n.node.(*generalNode); ok {
+	if v, ok := n.node.(*branchNode); ok {
 		blob, err := rlp.EncodeToBytes(v)
 		if err != nil {
 			panic(err)
@@ -214,16 +216,16 @@ func forGatherChildren(n node, onChild func(hash common.Hash)) {
 // all the internal caches, returning a node that only contains the raw data.
 func simplifyNode(n node) node {
 	switch n := n.(type) {
-	case *generalNode:
-		node := rawFullNode{n.Children[0], n.Children[1]}
-		for i := 0; i < len(node); i++ {
+	case *branchNode:
+		node := rawFullNode(n.Children)
+		/*for i := 0; i < len(node); i++ {
 			if node[i] != nil {
 				node[i] = simplifyNode(node[i])
 			}
-		}
+		}*/
 		return node
 
-	case valueNode, hashNode, rawNode:
+	case valueNode, hashNode, rawNode, singleNode:
 		return n
 
 	default:
@@ -237,7 +239,7 @@ func expandNode(hash hashNode, n node) node {
 	switch n := n.(type) {
 	case rawFullNode:
 		// Full nodes need child expansion
-		node := &generalNode{
+		node := &branchNode{
 			flags: nodeFlag{
 				hash: hash,
 			},
@@ -249,7 +251,7 @@ func expandNode(hash hashNode, n node) node {
 		}
 		return node
 
-	case valueNode, hashNode:
+	case valueNode, hashNode, singleNode:
 		return n
 
 	default:
@@ -266,18 +268,16 @@ func NewDatabase(diskdb ethdb.KeyValueStore) *Database {
 
 func MakeZeroHashes() {
 	if len(zerohashes) == 0 {
-		zerohashes = make([]common.Hash, 257)
-
-		copy(zerohashes[256][:], bytes.Repeat([]byte{0x00}, 32))
-		//hasher := newHasher(nil)
+		zerohashes = make([][]byte, 257)
+		tmp := crypto.Keccak256Hash(nil)
+		zerohashes[256] = tmp[:]
 		for i := uint32(256); i > 0; i-- {
-			n := &generalNode{}
+			n := &branchNode{}
 			n.Children[0] = hashNode(zerohashes[i][:])
 			n.Children[1] = hashNode(zerohashes[i][:])
-			hashed := hashGeneralNode(n, i-1)
-			zerohashes[i-1].SetBytes(hashed[:])
+			hashed := hashBranchNode(n, i-1)
+			zerohashes[i-1] = hashed
 		}
-		tt256m1 = new(big.Int).Sub(new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil), big.NewInt(1))
 	}
 }
 

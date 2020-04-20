@@ -17,10 +17,12 @@
 package trie
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 
 	"github.com/Onther-Tech/plasma-evm/common"
+	"github.com/Onther-Tech/plasma-evm/crypto"
 	"github.com/Onther-Tech/plasma-evm/ethdb"
 	"github.com/Onther-Tech/plasma-evm/log"
 	"github.com/Onther-Tech/plasma-evm/rlp"
@@ -37,48 +39,65 @@ func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) e
 	// Collect all nodes on the path to key.
 	tn := t.root
 	path := KeyToPath(key)
-	var nodes []node
+	var sidenodes []common.Hash
 
-	for i := 0; i < 256; i++ {
+	for i := 0; i < 256; {
 		switch n := tn.(type) {
-		case *generalNode:
+		case *branchNode:
 			branch := new(big.Int).And(new(big.Int).Set(new(big.Int).Rsh(path, 255)), big.NewInt(1)).Uint64()
+			switch tn := n.Children[1-branch].(type) {
+			case *branchNode:
+				sidenodes = append(sidenodes, common.BytesToHash(tn.flags.hash))
+			case hashNode:
+				sidenodes = append(sidenodes, common.BytesToHash(tn))
+			case nil:
+				sidenodes = append(sidenodes, common.BytesToHash(zerohashes[i+1][:]))
+			case valueNode:
+				sidenodes = append(sidenodes, tn.Hash)
+			default:
+			}
 			tn = n.Children[branch]
-			nodes = append(nodes, n)
 			path.Lsh(path, 1)
+			i++
 		case hashNode:
 			var err error
-			tn, err = t.resolveHash(n, nil, 0)
+			tn, err = t.resolveHash(n, 0)
 			if err != nil {
 				log.Error(fmt.Sprintf("Unhandled trie error: %v", err))
 				return err
 			}
+		case nil:
+			sidenodes = append(sidenodes, common.BytesToHash(zerohashes[i+1][:]))
+			i++
 		default:
 			panic(fmt.Sprintf("%T: invalid node: %v", tn, tn))
 		}
 	}
-	hasher := newHasher(nil)
-	defer returnHasherToPool(hasher)
-	for i, n := range nodes {
-		// Don't bother checking for errors here since hasher panics
-		// if encoding doesn't work and we're not writing to any database.
-		n, _, _ = hasher.hashChildren(n, nil)
-		hn, _ := hasher.store(n, nil, false)
-		if hash, ok := hn.(hashNode); ok || i == 0 {
-			// If the node's database encoding is a hash (or is the
-			// root node), it becomes a proof element.
-			if fromLevel > 0 {
-				fromLevel--
-			} else {
-				enc, _ := rlp.EncodeToBytes(n)
-				if !ok {
-					hash = hasher.makeHashNode(enc)
-				}
-				proofDb.Put(hash, enc)
-			}
-		}
+	cp := CompressProof(sidenodes)
+	proofDb.Put(t.root.(*branchNode).flags.hash, cp)
+	if v, ok := tn.(valueNode); ok {
+		proofDb.Put(key, v.Value)
+	} else {
 	}
 	return nil
+}
+
+func CompressProof(nodes []common.Hash) []byte {
+	MakeZeroHashes()
+	buf := make([][]byte, 0, 257)
+	buf = append(buf, bytes.Repeat([]byte{0x00}, 32))
+	for i, p := range nodes {
+		if bytes.Equal(p[:], zerohashes[i+1][:]) {
+			buf[0][uint(i/8)] ^= (1 << (i % 8))
+		} else {
+			buf = append(buf, buf[len(buf)-1])
+			copy(buf[2:], buf[1:len(buf)-1])
+			enc, _ := rlp.EncodeToBytes(p)
+			buf[1] = enc
+		}
+	}
+	enc, _ := rlp.EncodeToBytes(buf)
+	return enc
 }
 
 // Prove constructs a merkle proof for key. The result contains all encoded nodes
@@ -97,37 +116,61 @@ func (t *SecureTrie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWri
 // proof contains invalid trie nodes or the wrong value.
 func VerifyProof(rootHash common.Hash, key []byte, proofDb ethdb.KeyValueReader) (value []byte, nodes int, err error) {
 	path := KeyToPath(key)
-	wantHash := rootHash
-	for i := 0; ; i++ {
-		buf, _ := proofDb.Get(wantHash[:])
-		if buf == nil {
-			return nil, i, fmt.Errorf("proof node %d (hash %064x) missing", i, wantHash)
-		}
-		n, err := decodeNode(wantHash[:], buf)
-		if err != nil {
-			return nil, i, fmt.Errorf("bad proof node %d: %v", i, err)
-		}
-		pathrest, cld := get(n, path)
-		switch cld := cld.(type) {
-		case nil:
-			// The trie doesn't contain the key.
-			return nil, i, nil
-		case hashNode:
-			path = pathrest
-			copy(wantHash[:], cld)
-		case valueNode:
-			return cld, i + 1, nil
-		}
+	enc, _ := proofDb.Get(rootHash[:])
+	if enc == nil {
+		return nil, 0, fmt.Errorf("proof root (hash %064x) missing", rootHash)
 	}
+	value, err = proofDb.Get(key)
+	if err != nil {
+		value = nil
+	}
+	buf := enc
+	_, val, rest, err := rlp.Split(buf)
+	if err != nil {
+		return nil, 0, err
+	}
+	bits, rest, err := rlp.SplitString(val)
+	if err != nil {
+		// TODO: error
+		return nil, 0, &MissingNodeError{rootHash, 0}
+	}
+	buf = rest
+	var hashed hashNode
+	valuehash := crypto.Keccak256Hash(value)
+	for i := 0; i < 256; i++ {
+		var side hashNode
+		if bits[uint((255-i)/8)]&(1<<((255-i)%8)) != 0 {
+			side = zerohashes[256-i]
+		} else {
+			val, rest, err := rlp.SplitString(buf)
+			if err != nil {
+				break
+			}
+			side, _, _ = rlp.SplitString(val)
+			buf = rest
+		}
+
+		index := new(big.Int).And(new(big.Int).Set(path), big.NewInt(1)).Uint64()
+		b := branchNode{}
+		b.Children[index] = hashNode(valuehash[:])
+		b.Children[1-index] = hashNode(side[:])
+		hashed = hashBranchNode(&b, uint32(i))
+		valuehash.SetBytes(hashed[:])
+		path.Rsh(path, 1)
+	}
+
+	if rootHash != common.BytesToHash(hashed) {
+		return nil, 0, fmt.Errorf("proof failed, got 0x%x want 0x%x", hashed[:], rootHash)
+	}
+	return value, 256, nil
 }
 
 func get(tn node, path *big.Int) (*big.Int, node) {
 	for {
 		switch n := tn.(type) {
-		case *generalNode:
+		case *branchNode:
 			branch := new(big.Int).And(new(big.Int).Set(new(big.Int).Rsh(path, 255)), big.NewInt(1)).Uint64()
 			tn = n.Children[branch]
-			//key = key[1:]
 			path.Lsh(path, 1)
 		case hashNode:
 			return path, n

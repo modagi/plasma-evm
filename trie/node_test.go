@@ -18,9 +18,6 @@ package trie
 
 import (
 	"bytes"
-	"testing"
-
-	"github.com/Onther-Tech/plasma-evm/rlp"
 )
 
 func newTestFullNode(v []byte) []interface{} {
@@ -33,6 +30,7 @@ func newTestFullNode(v []byte) []interface{} {
 	return fullNodeData
 }
 
+/*
 func TestDecodeNestedNode(t *testing.T) {
 	fullNodeData := newTestFullNode([]byte("fullnode"))
 
@@ -91,4 +89,4 @@ func TestDecodeFullNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode full node err: %v", err)
 	}
-}
+}*/

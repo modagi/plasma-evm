@@ -80,7 +80,7 @@ func (h *hasher) hash(n node, db *Database, force bool) (node, node, error) {
 		}
 		if !dirty {
 			switch n.(type) {
-			case *generalNode:
+			case *branchNode:
 				return hash, hash, nil
 			default:
 				return hash, n, nil
@@ -101,7 +101,7 @@ func (h *hasher) hash(n node, db *Database, force bool) (node, node, error) {
 	// without copying the node first because hashChildren copies it.
 	cachedHash, _ := hashed.(hashNode)
 	switch cn := cached.(type) {
-	case *generalNode:
+	case *branchNode:
 		cn.flags.hash = cachedHash
 		if db != nil {
 			cn.flags.dirty = false
@@ -117,7 +117,7 @@ func (h *hasher) hashChildren(original node, db *Database) (node, node, error) {
 	var err error
 
 	switch n := original.(type) {
-	case *generalNode:
+	case *branchNode:
 		// Hash the full node's children, caching the newly hashed subtrees
 		collapsed, cached := n.copy(), n.copy()
 
@@ -168,10 +168,10 @@ func (h *hasher) store(n node, db *Database, force bool) (node, error) {
 		// Track external references from account->storage trie
 		if h.onleaf != nil {
 			switch n := n.(type) {
-			case *generalNode:
+			case *branchNode:
 				for i := 0; i < 16; i++ {
 					if child, ok := n.Children[i].(valueNode); ok {
-						h.onleaf(child, hash)
+						h.onleaf(child.Value, hash)
 					}
 				}
 			}

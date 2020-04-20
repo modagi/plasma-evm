@@ -17,6 +17,7 @@
 package trie
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -93,7 +94,7 @@ func NewSync(root common.Hash, database ethdb.KeyValueReader, callback LeafCallb
 // AddSubTrie registers a new trie to the sync code, rooted at the designated parent.
 func (s *Sync) AddSubTrie(root common.Hash, depth int, parent common.Hash, callback LeafCallback) {
 	// Short circuit if the trie is empty or already known
-	if root == zerohashes[0] {
+	if bytes.Equal(root[:], zerohashes[0]) {
 		return
 	}
 	if _, ok := s.membatch.batch[root]; ok {
@@ -265,7 +266,7 @@ func (s *Sync) children(req *request, object node) ([]*request, error) {
 	var children []child
 
 	switch node := (object).(type) {
-	case *generalNode:
+	case *branchNode:
 		for i := 0; i < 2; i++ {
 			if node.Children[i] != nil {
 				children = append(children, child{
@@ -275,7 +276,8 @@ func (s *Sync) children(req *request, object node) ([]*request, error) {
 			}
 		}
 	default:
-		panic(fmt.Sprintf("unknown node: %+v", node))
+		return nil, nil
+		//panic(fmt.Sprintf("unknown node: %+v", node))
 	}
 	// Iterate over the children, and request all unknown ones
 	requests := make([]*request, 0, len(children))
@@ -283,7 +285,7 @@ func (s *Sync) children(req *request, object node) ([]*request, error) {
 		// Notify any external watcher of a new key/value node
 		if req.callback != nil {
 			if node, ok := (child.node).(valueNode); ok {
-				if err := req.callback(node, req.hash); err != nil {
+				if err := req.callback(node.Value, req.hash); err != nil {
 					return nil, err
 				}
 			}
